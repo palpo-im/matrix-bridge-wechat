@@ -640,10 +640,13 @@ dependencies = [
  "downcast-rs",
  "itoa",
  "libsqlite3-sys",
+ "mysqlclient-sys",
+ "percent-encoding",
  "pq-sys",
  "r2d2",
  "sqlite-wasm-rs",
  "time",
+ "url",
 ]
 
 [[package]]
@@ -1469,10 +1472,11 @@ checksum = "bcc35a38544a891a5f7c865aca548a982ccb3b8650a5b06d0fd33a10283c56fc"
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.30.1"
+version = "0.35.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2e99fb7a497b1e3339bc746195567ed8d3e24945ecd636e3619d20b9de9e9149"
+checksum = "133c182a6a2c87864fe97778797e46c7e999672690dc9fa3ee8e241aa4a9c13f"
 dependencies = [
+ "cc",
  "pkg-config",
  "vcpkg",
 ]
@@ -1542,6 +1546,7 @@ dependencies = [
  "diesel",
  "futures-util",
  "lazy_static",
+ "libsqlite3-sys",
  "once_cell",
  "regex",
  "reqwest",
@@ -1631,6 +1636,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "mysqlclient-sys"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92ed7312f0cfc4032aea6f8ea2abb4d288e4413e33bf0c80ad30eef8aa8fb9d8"
+dependencies = [
+ "pkg-config",
+ "semver",
+ "vcpkg",
 ]
 
 [[package]]

@@ -1,12 +1,18 @@
 [package]
 name = "matrix-bridge-wechat"
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.75"
+edition = "2024"
+rust-version = "1.93"
 authors = ["chris <chris@acroidea.com>"]
 description = "A Matrix-WeChat puppeting bridge"
 license = "AGPL-3.0-or-later"
 repository = "https://github.com/palpo-im/matrix-bridge-wechat"
+
+[features]
+default = ["postgres", "sqlite"]
+postgres = ["diesel/postgres"]
+sqlite = ["diesel/sqlite", "dep:libsqlite3-sys"]
+mysql = ["diesel/mysql"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }
@@ -14,7 +20,8 @@ salvo = { version = "0.89", features = ["websocket", "cors"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-diesel = { version = "2.1", features = ["sqlite", "postgres", "r2d2", "chrono"] }
+diesel = { version = "2.1", features = ["r2d2", "chrono"] }
+libsqlite3-sys = { version = "0.35.0", features = ["bundled"], optional = true }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
