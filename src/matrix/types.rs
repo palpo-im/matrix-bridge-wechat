@@ -275,7 +275,7 @@ impl Default for PowerLevelsContent {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CreateRoomRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub visibility: Option<String>,

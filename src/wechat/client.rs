@@ -2,8 +2,9 @@ use std::sync::Arc;
 
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
+use tracing::warn;
 
-use super::{WechatService, Request, RequestType, UserInfo, GroupInfo};
+use super::{WechatService, Request, RequestType, UserInfo, GroupInfo, Event};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GroupMember {
@@ -571,12 +572,79 @@ impl WechatClient {
             request_type: RequestType::SyncMessages,
             data: None,
         }).await?;
-        
+
         if let Some(error) = response.error {
             return Err(anyhow!("{}", error));
         }
-        
+
         Ok(())
+    }
+
+    /// Login via QR code. Returns the QR code image bytes on success.
+    pub async fn login_with_qrcode(&self) -> Result<Vec<u8>> {
+        let response = self.service.request(&self.mxid, &Request {
+            request_type: RequestType::LoginQr,
+            data: None,
+        }).await?;
+
+        if let Some(error) = response.error {
+            warn!("Failed to login with QR code: {}", error);
+            return Err(anyhow!("{}", error));
+        }
+
+        response
+            .as_bytes()
+            .ok_or_else(|| anyhow!("invalid QR code response"))
+    }
+
+    /// Generic event send. Wraps the event in a Request, sends it,
+    /// and returns the response event (if any).
+    pub async fn send_event(&self, event: &Event) -> Result<Option<Event>> {
+        let response = self.service.request(&self.mxid, &Request {
+            request_type: RequestType::Event,
+            data: serde_json::to_value(event).ok(),
+        }).await?;
+
+        if let Some(error) = response.error {
+            warn!("Failed to send event: {}", error);
+            return Err(anyhow!("{}", error));
+        }
+
+        Ok(response.as_event())
+    }
+
+    /// Send an audio message. Returns the sent message ID.
+    pub async fn send_audio_message(&self, chat_id: &str, audio_data: &[u8], reply_to: Option<&str>) -> Result<String> {
+        let audio_base64 = base64_encode(audio_data);
+        let data = if let Some(reply) = reply_to {
+            serde_json::json!({
+                "chat_id": chat_id,
+                "audio": audio_base64,
+                "reply_to": reply,
+            })
+        } else {
+            serde_json::json!({
+                "chat_id": chat_id,
+                "audio": audio_base64,
+            })
+        };
+
+        let response = self.service.request(&self.mxid, &Request {
+            request_type: RequestType::SendAudio,
+            data: Some(data),
+        }).await?;
+
+        if let Some(error) = response.error {
+            return Err(anyhow!("{}", error));
+        }
+
+        if let Some(data) = &response.data {
+            if let Some(msg_id) = data.get("msg_id").and_then(|v| v.as_str()) {
+                return Ok(msg_id.to_string());
+            }
+        }
+
+        Err(anyhow!("no msg_id in response"))
     }
 }
 

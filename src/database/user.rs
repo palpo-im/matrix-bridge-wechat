@@ -33,7 +33,7 @@ impl User {
 pub struct UserQuery;
 
 macro_rules! impl_user_query_for_conn {
-    ($get_by_mxid:ident, $get_by_uin:ident, $get_all_logged_in:ident, $insert:ident, $update:ident, $conn_ty:ty) => {
+    ($get_by_mxid:ident, $get_by_uin:ident, $get_all_logged_in:ident, $get_all:ident, $insert:ident, $update:ident, $conn_ty:ty) => {
         pub fn $get_by_mxid(conn: &mut $conn_ty, mxid: &str) -> Result<Option<User>> {
             let user = users::table
                 .select(User::as_select())
@@ -56,6 +56,13 @@ macro_rules! impl_user_query_for_conn {
             let items = users::table
                 .select(User::as_select())
                 .filter(users::uin.is_not_null().and(users::uin.ne("")))
+                .load(conn)?;
+            Ok(items)
+        }
+
+        pub fn $get_all(conn: &mut $conn_ty) -> Result<Vec<User>> {
+            let items = users::table
+                .select(User::as_select())
                 .load(conn)?;
             Ok(items)
         }
@@ -83,6 +90,7 @@ impl UserQuery {
         get_by_mxid_sqlite,
         get_by_uin_sqlite,
         get_all_logged_in_sqlite,
+        get_all_sqlite,
         insert_sqlite,
         update_sqlite,
         SqliteConnection
@@ -92,6 +100,7 @@ impl UserQuery {
         get_by_mxid_postgres,
         get_by_uin_postgres,
         get_all_logged_in_postgres,
+        get_all_postgres,
         insert_postgres,
         update_postgres,
         PgConnection

@@ -303,12 +303,48 @@ impl MatrixEventHandler {
     }
 
     async fn handle_room_name_event(&self, event: &RoomEvent) -> anyhow::Result<()> {
-        debug!("Room name changed: {:?}", event);
+        let Some(room_id) = &event.room_id else {
+            return Ok(());
+        };
+
+        let name = event.content.as_ref()
+            .and_then(|c| c.get("name"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        debug!("Room name changed in {}: {}", room_id, name);
+
+        let Some(portal) = self.get_portal_by_mxid(room_id).await? else {
+            return Ok(());
+        };
+
+        let mut portal = portal.as_ref().clone();
+        portal.set_name(name).await?;
+
+        info!("Updated portal name for room {} to '{}'", room_id, name);
         Ok(())
     }
 
     async fn handle_room_topic_event(&self, event: &RoomEvent) -> anyhow::Result<()> {
-        debug!("Room topic changed: {:?}", event);
+        let Some(room_id) = &event.room_id else {
+            return Ok(());
+        };
+
+        let topic = event.content.as_ref()
+            .and_then(|c| c.get("topic"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        debug!("Room topic changed in {}: {}", room_id, topic);
+
+        let Some(portal) = self.get_portal_by_mxid(room_id).await? else {
+            return Ok(());
+        };
+
+        let mut portal = portal.as_ref().clone();
+        portal.set_topic(topic).await?;
+
+        info!("Updated portal topic for room {} to '{}'", room_id, topic);
         Ok(())
     }
 
@@ -383,23 +419,81 @@ impl MatrixEventHandler {
                 crate::bridge::command::CommandResult::NeedsLogin => {
                     "Please login first using `login` command.".to_string()
                 }
+                crate::bridge::command::CommandResult::Ping => {
+                    let user = self.get_user_by_mxid(sender).await?;
+                    if let Some(user) = user {
+                        if user.is_logged_in() {
+                            if let Some(uin) = user.uin() {
+                                format!("Logged in as {}", uin)
+                            } else {
+                                "Logged in (unknown UIN)".to_string()
+                            }
+                        } else {
+                            "Not logged in.".to_string()
+                        }
+                    } else {
+                        "Not logged in.".to_string()
+                    }
+                }
                 crate::bridge::command::CommandResult::Login => {
                     let user = self.get_or_create_user_by_mxid(sender).await?;
                     let mut user = user.as_ref().clone();
-                    
+
                     if user.is_logged_in() {
                         "You are already logged in.".to_string()
                     } else {
-                        user.set_client(self.bridge.get_client(sender));
-                        match user.login(self.bridge.wechat_service.clone()).await {
+                        let wechat_client = self.bridge.get_client(sender);
+                        user.set_client(wechat_client.clone());
+
+                        // Try to connect first
+                        match wechat_client.connect().await {
                             Ok(_) => {
-                                if let Some(room) = user.management_room() {
-                                    let _ = user.get_or_create_management_room(&client, &self.bridge.config.appservice.bot.mxid(&self.bridge.config.homeserver.domain)).await;
+                                // Check if already logged in on the agent side
+                                match wechat_client.is_logged_in().await {
+                                    Ok(true) => {
+                                        // Already logged in, just sync user info
+                                        match wechat_client.get_self().await {
+                                            Ok(user_info) => {
+                                                let _ = user.set_uin(&user_info.id).await;
+                                                let _ = user.get_or_create_management_room(&client, &self.bridge.config.appservice.bot.mxid(&self.bridge.config.homeserver.domain)).await;
+                                                format!("Already logged in as {}.", user_info.name)
+                                            }
+                                            Err(_) => "Connected and logged in.".to_string(),
+                                        }
+                                    }
+                                    _ => {
+                                        // Not logged in, request QR code
+                                        match wechat_client.login_with_qrcode().await {
+                                            Ok(qr_data) => {
+                                                // Upload QR code image to Matrix
+                                                match client.upload_media(&qr_data, "image/png", "qrcode.png").await {
+                                                    Ok(mxc_url) => {
+                                                        let content = serde_json::json!({
+                                                            "msgtype": "m.image",
+                                                            "body": "Scan this QR code with WeChat to log in",
+                                                            "url": mxc_url,
+                                                            "info": {
+                                                                "mimetype": "image/png",
+                                                                "size": qr_data.len() as u64,
+                                                            }
+                                                        });
+                                                        let _ = client.send_message(room_id, "m.room.message", &content, None).await;
+                                                        "Scan the QR code above with WeChat to log in.".to_string()
+                                                    }
+                                                    Err(e) => {
+                                                        format!("Failed to upload QR code: {}", e)
+                                                    }
+                                                }
+                                            }
+                                            Err(e) => {
+                                                format!("Failed to get QR code: {}", e)
+                                            }
+                                        }
+                                    }
                                 }
-                                "Login successful!".to_string()
                             }
                             Err(e) => {
-                                format!("Login failed: {}", e)
+                                format!("Failed to connect: {}", e)
                             }
                         }
                     }
@@ -408,8 +502,12 @@ impl MatrixEventHandler {
                     let user = self.get_user_by_mxid(sender).await?;
                     if let Some(user) = user {
                         let mut user = user.as_ref().clone();
-                        user.logout().await?;
-                        "Logged out successfully.".to_string()
+                        if user.is_logged_in() {
+                            user.logout().await?;
+                            "Logged out successfully.".to_string()
+                        } else {
+                            "You are not logged in.".to_string()
+                        }
                     } else {
                         "You are not logged in.".to_string()
                     }
@@ -468,21 +566,115 @@ impl MatrixEventHandler {
                         "Please login first.".to_string()
                     }
                 }
+                crate::bridge::command::CommandResult::Search(query) => {
+                    let user = self.get_user_by_mxid(sender).await?;
+                    if let Some(user) = user {
+                        if let Some(wechat_client) = user.get_client() {
+                            let query_lower = query.to_lowercase();
+                            let mut results = Vec::new();
+
+                            if let Ok(friends) = wechat_client.get_friend_list().await {
+                                for friend in &friends {
+                                    if friend.name.to_lowercase().contains(&query_lower)
+                                        || friend.id.to_lowercase().contains(&query_lower)
+                                        || friend.remark.as_deref().unwrap_or("").to_lowercase().contains(&query_lower)
+                                    {
+                                        let remark = friend.remark.as_deref().unwrap_or("");
+                                        if remark.is_empty() {
+                                            results.push(format!("- [Contact] {} ({})", friend.name, friend.id));
+                                        } else {
+                                            results.push(format!("- [Contact] {} ({}, {})", friend.name, remark, friend.id));
+                                        }
+                                    }
+                                }
+                            }
+
+                            if let Ok(groups) = wechat_client.get_group_list().await {
+                                for group in &groups {
+                                    if group.name.to_lowercase().contains(&query_lower)
+                                        || group.id.to_lowercase().contains(&query_lower)
+                                    {
+                                        results.push(format!("- [Group] {} ({})", group.name, group.id));
+                                    }
+                                }
+                            }
+
+                            if results.is_empty() {
+                                format!("No results found for '{}'.", query)
+                            } else {
+                                let mut lines = vec![format!("Found {} results for '{}':", results.len(), query)];
+                                lines.extend(results.into_iter().take(20));
+                                lines.join("\n")
+                            }
+                        } else {
+                            "Please login first.".to_string()
+                        }
+                    } else {
+                        "Please login first.".to_string()
+                    }
+                }
                 crate::bridge::command::CommandResult::SyncContacts => {
-                    "Syncing contacts...".to_string()
+                    let user = self.get_user_by_mxid(sender).await?;
+                    if let Some(user) = user {
+                        let user = user.as_ref().clone();
+                        if user.is_logged_in() {
+                            let bridge_clone = self.bridge.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = user.sync_contacts(&bridge_clone).await {
+                                    warn!("Failed to sync contacts: {}", e);
+                                }
+                            });
+                            "Syncing contacts in the background...".to_string()
+                        } else {
+                            "Please login first.".to_string()
+                        }
+                    } else {
+                        "Please login first.".to_string()
+                    }
                 }
                 crate::bridge::command::CommandResult::SyncGroups => {
-                    "Syncing groups...".to_string()
+                    let user = self.get_user_by_mxid(sender).await?;
+                    if let Some(user) = user {
+                        let user = user.as_ref().clone();
+                        if user.is_logged_in() {
+                            let bridge_clone = self.bridge.clone();
+                            tokio::spawn(async move {
+                                if let Err(e) = user.sync_groups(&bridge_clone, true).await {
+                                    warn!("Failed to sync groups: {}", e);
+                                }
+                            });
+                            "Syncing groups in the background...".to_string()
+                        } else {
+                            "Please login first.".to_string()
+                        }
+                    } else {
+                        "Please login first.".to_string()
+                    }
                 }
                 crate::bridge::command::CommandResult::SyncSpace => {
-                    "Syncing space...".to_string()
+                    let user = self.get_user_by_mxid(sender).await?;
+                    if let Some(user) = user {
+                        let mut user = user.as_ref().clone();
+                        if user.is_logged_in() {
+                            match user.get_or_create_space_room(&client).await {
+                                Ok(space_room_id) => {
+                                    format!("Space room: {}", space_room_id)
+                                }
+                                Err(e) => format!("Failed to sync space: {}", e),
+                            }
+                        } else {
+                            "Please login first.".to_string()
+                        }
+                    } else {
+                        "Please login first.".to_string()
+                    }
                 }
                 crate::bridge::command::CommandResult::DeletePortal => {
                     let user = self.get_user_by_mxid(sender).await?;
                     if let Some(_user) = user {
                         if let Some(portal) = self.bridge.get_portal_by_mxid(room_id).await? {
                             let mut portal = Arc::try_unwrap(portal).unwrap_or_else(|p| (*p).clone());
-                            portal.cleanup(&client).await?;
+                            portal.cleanup(&client, &self.bridge.config.bridge.user_prefix).await?;
                             "Portal deleted.".to_string()
                         } else {
                             "This is not a portal room.".to_string()
@@ -497,7 +689,7 @@ impl MatrixEventHandler {
                     for portal in portals {
                         let p = crate::bridge::portal::BridgePortal::from_db(portal, self.bridge.db.clone());
                         let mut p = p;
-                        if let Err(e) = p.cleanup(&client).await {
+                        if let Err(e) = p.cleanup(&client, &self.bridge.config.bridge.user_prefix).await {
                             warn!("Failed to cleanup portal: {}", e);
                         }
                     }

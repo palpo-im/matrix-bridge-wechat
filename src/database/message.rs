@@ -120,6 +120,7 @@ macro_rules! impl_message_query_for_conn {
         $get_by_id:ident,
         $get_by_mxid:ident,
         $get_by_msg_id:ident,
+        $get_all:ident,
         $get_last:ident,
         $insert:ident,
         $update_mxid:ident,
@@ -157,6 +158,15 @@ macro_rules! impl_message_query_for_conn {
                 .first(conn)
                 .optional()?;
             Ok(item)
+        }
+
+        pub fn $get_all(conn: &mut $conn_ty, key: &PortalKey) -> Result<Vec<Message>> {
+            let items = message::table
+                .select(Message::as_select())
+                .filter(message::chat_uid.eq(&key.uid))
+                .filter(message::chat_receiver.eq(&key.receiver))
+                .load(conn)?;
+            Ok(items)
         }
 
         pub fn $get_last(conn: &mut $conn_ty, key: &PortalKey) -> Result<Option<Message>> {
@@ -218,6 +228,7 @@ impl MessageQuery {
         get_by_id_sqlite,
         get_by_mxid_sqlite,
         get_by_msg_id_sqlite,
+        get_all_sqlite,
         get_last_sqlite,
         insert_sqlite,
         update_mxid_sqlite,
@@ -229,6 +240,7 @@ impl MessageQuery {
         get_by_id_postgres,
         get_by_mxid_postgres,
         get_by_msg_id_postgres,
+        get_all_postgres,
         get_last_postgres,
         insert_postgres,
         update_mxid_postgres,

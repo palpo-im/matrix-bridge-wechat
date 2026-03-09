@@ -3,11 +3,13 @@ mod user;
 mod portal;
 mod puppet;
 mod message;
+mod user_portal;
 
 pub use user::*;
 pub use portal::*;
 pub use puppet::*;
 pub use message::*;
+pub use user_portal::*;
 
 use anyhow::Context;
 use anyhow::Result;
@@ -368,6 +370,172 @@ impl Database {
         }
     }
 
+    // --- get_all methods (Task 2) ---
+
+    pub async fn get_all_users(&self) -> Result<Vec<User>> {
+        match &self.inner {
+            DatabaseInner::Sqlite(_) => self.with_sqlite_conn(UserQuery::get_all_sqlite).await,
+            DatabaseInner::Postgres(_) => self.with_postgres_conn(UserQuery::get_all_postgres).await,
+        }
+    }
+
+    pub async fn get_all_portals(&self) -> Result<Vec<Portal>> {
+        match &self.inner {
+            DatabaseInner::Sqlite(_) => self.with_sqlite_conn(PortalQuery::get_all_sqlite).await,
+            DatabaseInner::Postgres(_) => self.with_postgres_conn(PortalQuery::get_all_postgres).await,
+        }
+    }
+
+    pub async fn get_all_portals_by_uid(&self, uid: &str) -> Result<Vec<Portal>> {
+        let uid = uid.to_owned();
+        match &self.inner {
+            DatabaseInner::Sqlite(_) => {
+                self.with_sqlite_conn(move |conn| PortalQuery::get_all_by_uid_sqlite(conn, &uid))
+                    .await
+            }
+            DatabaseInner::Postgres(_) => {
+                self.with_postgres_conn(move |conn| PortalQuery::get_all_by_uid_postgres(conn, &uid))
+                    .await
+            }
+        }
+    }
+
+    pub async fn find_private_chats(&self, receiver: &str) -> Result<Vec<Portal>> {
+        let receiver = receiver.to_owned();
+        match &self.inner {
+            DatabaseInner::Sqlite(_) => {
+                self.with_sqlite_conn(move |conn| PortalQuery::find_private_chats_sqlite(conn, &receiver))
+                    .await
+            }
+            DatabaseInner::Postgres(_) => {
+                self.with_postgres_conn(move |conn| PortalQuery::find_private_chats_postgres(conn, &receiver))
+                    .await
+            }
+        }
+    }
+
+    pub async fn get_all_puppets(&self) -> Result<Vec<Puppet>> {
+        match &self.inner {
+            DatabaseInner::Sqlite(_) => self.with_sqlite_conn(PuppetQuery::get_all_sqlite).await,
+            DatabaseInner::Postgres(_) => self.with_postgres_conn(PuppetQuery::get_all_postgres).await,
+        }
+    }
+
+    pub async fn get_all_messages(&self, key: &PortalKey) -> Result<Vec<Message>> {
+        let key = key.clone();
+        match &self.inner {
+            DatabaseInner::Sqlite(_) => {
+                self.with_sqlite_conn(move |conn| MessageQuery::get_all_sqlite(conn, &key))
+                    .await
+            }
+            DatabaseInner::Postgres(_) => {
+                self.with_postgres_conn(move |conn| MessageQuery::get_all_postgres(conn, &key))
+                    .await
+            }
+        }
+    }
+
+    // --- user_portal methods (Task 1) ---
+
+    pub async fn get_last_read_ts(&self, user_mxid: &str, key: &PortalKey) -> Result<i64> {
+        let user_mxid = user_mxid.to_owned();
+        let key = key.clone();
+        match &self.inner {
+            DatabaseInner::Sqlite(_) => {
+                self.with_sqlite_conn(move |conn| {
+                    UserPortalQuery::get_last_read_ts_sqlite(conn, &user_mxid, &key)
+                })
+                .await
+            }
+            DatabaseInner::Postgres(_) => {
+                self.with_postgres_conn(move |conn| {
+                    UserPortalQuery::get_last_read_ts_postgres(conn, &user_mxid, &key)
+                })
+                .await
+            }
+        }
+    }
+
+    pub async fn set_last_read_ts(
+        &self,
+        user_mxid: &str,
+        key: &PortalKey,
+        ts: i64,
+    ) -> Result<()> {
+        let user_mxid = user_mxid.to_owned();
+        let key = key.clone();
+        match &self.inner {
+            DatabaseInner::Sqlite(_) => {
+                self.with_sqlite_conn(move |conn| {
+                    UserPortalQuery::set_last_read_ts_sqlite(conn, &user_mxid, &key, ts)
+                })
+                .await
+            }
+            DatabaseInner::Postgres(_) => {
+                self.with_postgres_conn(move |conn| {
+                    UserPortalQuery::set_last_read_ts_postgres(conn, &user_mxid, &key, ts)
+                })
+                .await
+            }
+        }
+    }
+
+    pub async fn is_in_space(&self, user_mxid: &str, key: &PortalKey) -> Result<bool> {
+        let user_mxid = user_mxid.to_owned();
+        let key = key.clone();
+        match &self.inner {
+            DatabaseInner::Sqlite(_) => {
+                self.with_sqlite_conn(move |conn| {
+                    UserPortalQuery::is_in_space_sqlite(conn, &user_mxid, &key)
+                })
+                .await
+            }
+            DatabaseInner::Postgres(_) => {
+                self.with_postgres_conn(move |conn| {
+                    UserPortalQuery::is_in_space_postgres(conn, &user_mxid, &key)
+                })
+                .await
+            }
+        }
+    }
+
+    pub async fn mark_in_space(&self, user_mxid: &str, key: &PortalKey) -> Result<()> {
+        let user_mxid = user_mxid.to_owned();
+        let key = key.clone();
+        match &self.inner {
+            DatabaseInner::Sqlite(_) => {
+                self.with_sqlite_conn(move |conn| {
+                    UserPortalQuery::mark_in_space_sqlite(conn, &user_mxid, &key)
+                })
+                .await
+            }
+            DatabaseInner::Postgres(_) => {
+                self.with_postgres_conn(move |conn| {
+                    UserPortalQuery::mark_in_space_postgres(conn, &user_mxid, &key)
+                })
+                .await
+            }
+        }
+    }
+
+    pub async fn find_portals_not_in_space(&self, receiver: &str) -> Result<Vec<PortalKey>> {
+        let receiver = receiver.to_owned();
+        match &self.inner {
+            DatabaseInner::Sqlite(_) => {
+                self.with_sqlite_conn(move |conn| {
+                    UserPortalQuery::find_portals_not_in_space_sqlite(conn, &receiver)
+                })
+                .await
+            }
+            DatabaseInner::Postgres(_) => {
+                self.with_postgres_conn(move |conn| {
+                    UserPortalQuery::find_portals_not_in_space_postgres(conn, &receiver)
+                })
+                .await
+            }
+        }
+    }
+
     async fn with_sqlite_conn<T, F>(&self, f: F) -> Result<T>
     where
         T: Send + 'static,
@@ -423,10 +591,13 @@ pub struct PortalKey {
 
 impl PortalKey {
     pub fn new(uid: impl Into<String>, receiver: impl Into<String>) -> Self {
-        Self {
-            uid: uid.into(),
-            receiver: receiver.into(),
-        }
+        let uid = uid.into();
+        let receiver = if uid.starts_with("@@") {
+            uid.clone()
+        } else {
+            receiver.into()
+        };
+        Self { uid, receiver }
     }
 }
 

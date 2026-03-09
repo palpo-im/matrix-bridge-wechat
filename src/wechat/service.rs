@@ -8,10 +8,10 @@ use salvo::conn::TcpListener;
 use salvo::prelude::*;
 use salvo::websocket::{WebSocketUpgrade, Message, WebSocket};
 use tokio::sync::{Mutex, RwLock, mpsc, oneshot, broadcast};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::{Message as WxMessage, Request as WxRequest, Response as WxResponse, Event, RequestType, MessageType};
-use super::{UserInfo, GroupInfo};
+use super::{UserInfo, GroupInfo, WechatClient};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
@@ -32,7 +32,8 @@ pub struct WechatService {
     connections: Arc<RwLock<HashMap<String, Connection>>>,
     pending_requests: Arc<Mutex<HashMap<i64, PendingRequest>>>,
     request_id: Arc<AtomicI64>,
-    event_tx: broadcast::Sender<Event>,
+    clients: Arc<RwLock<HashMap<String, WechatClient>>>,
+    event_tx: broadcast::Sender<(String, Event)>,
 }
 
 impl WechatService {
@@ -44,12 +45,37 @@ impl WechatService {
             connections: Arc::new(RwLock::new(HashMap::new())),
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
             request_id: Arc::new(AtomicI64::new(0)),
+            clients: Arc::new(RwLock::new(HashMap::new())),
             event_tx,
         }
     }
 
-    pub fn subscribe_events(&self) -> broadcast::Receiver<Event> {
+    pub fn subscribe_events(&self) -> broadcast::Receiver<(String, Event)> {
         self.event_tx.subscribe()
+    }
+
+    /// Create or retrieve a WechatClient for the given MXID.
+    pub async fn new_client(self: &Arc<Self>, mxid: &str) -> WechatClient {
+        let mut clients = self.clients.write().await;
+        if let Some(client) = clients.get(mxid) {
+            return client.clone();
+        }
+        let client = WechatClient::new(mxid.to_string(), Arc::clone(self));
+        clients.insert(mxid.to_string(), client.clone());
+        client
+    }
+
+    /// Graceful shutdown: close all WebSocket connections.
+    pub async fn stop(&self) {
+        info!("WechatService stopping");
+        let conns = self.connections.read().await;
+        for (addr, _conn) in conns.iter() {
+            info!("Closing connection to {}", addr);
+        }
+        drop(conns);
+
+        let mut conns = self.connections.write().await;
+        conns.clear();
     }
 
     fn next_request_id(&self) -> i64 {
@@ -59,21 +85,22 @@ impl WechatService {
     pub async fn request(&self, mxid: &str, req: &WxRequest) -> Result<WxResponse> {
         let id = self.next_request_id();
         let (tx, rx) = oneshot::channel();
-        
+
         {
             let mut pending = self.pending_requests.lock().await;
             pending.insert(id, PendingRequest { tx });
         }
-        
+
         let msg = WxMessage {
             id,
             mxid: mxid.to_string(),
             msg_type: MessageType::Request,
             data: serde_json::to_value(req).ok(),
         };
-        
+
         let conn = self.get_connection().await;
         if let Some(conn) = conn {
+            debug!("Send request message #{} {}", id, req.request_type);
             let json = serde_json::to_string(&msg)?;
             conn.tx.send(json)?;
         } else {
@@ -81,9 +108,12 @@ impl WechatService {
             pending.remove(&id);
             return Err(anyhow!("no agent connection available"));
         }
-        
+
         match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
-            Ok(Ok(response)) => Ok(response),
+            Ok(Ok(response)) => {
+                debug!("Receive response message #{} {}", id, response.response_type);
+                Ok(response)
+            }
             Ok(Err(_)) => Err(anyhow!("response channel closed")),
             Err(_) => {
                 let mut pending = self.pending_requests.lock().await;
@@ -107,7 +137,7 @@ impl WechatService {
                             if request.request_type == RequestType::Event {
                                 if let Some(event_data) = &request.data {
                                     if let Ok(event) = serde_json::from_value::<Event>(event_data.clone()) {
-                                        let _ = self.event_tx.send(event);
+                                        let _ = self.event_tx.send((msg.mxid.clone(), event));
                                     }
                                 }
                             }
@@ -151,7 +181,7 @@ struct WebSocketHandler {
     secret: String,
     connections: Arc<RwLock<HashMap<String, Connection>>>,
     pending_requests: Arc<Mutex<HashMap<i64, PendingRequest>>>,
-    event_tx: broadcast::Sender<Event>,
+    event_tx: broadcast::Sender<(String, Event)>,
 }
 
 #[handler]
@@ -188,7 +218,7 @@ async fn handle_socket(
     addr: String,
     connections: Arc<RwLock<HashMap<String, Connection>>>,
     pending_requests: Arc<Mutex<HashMap<i64, PendingRequest>>>,
-    event_tx: broadcast::Sender<Event>,
+    event_tx: broadcast::Sender<(String, Event)>,
 ) {
     info!("Agent connected from {}", addr);
     
@@ -227,9 +257,11 @@ async fn handle_socket(
                                                 if request.request_type == RequestType::Event {
                                                     if let Some(event_data) = &request.data {
                                                         if let Ok(event) = serde_json::from_value::<Event>(event_data.clone()) {
-                                                            let _ = event_tx.send(event);
+                                                            let _ = event_tx.send((wx_msg.mxid.clone(), event));
                                                         }
                                                     }
+                                                } else {
+                                                    warn!("Request {} not supported", request.request_type);
                                                 }
                                             }
                                         }
@@ -240,6 +272,8 @@ async fn handle_socket(
                                                 let mut pending = pending_requests.lock().await;
                                                 if let Some(req) = pending.remove(&wx_msg.id) {
                                                     let _ = req.tx.send(response);
+                                                } else {
+                                                    warn!("Dropping response to {}: unknown request ID", wx_msg.id);
                                                 }
                                             }
                                         }

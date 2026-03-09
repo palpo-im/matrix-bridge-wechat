@@ -52,6 +52,9 @@ macro_rules! impl_portal_query_for_conn {
         $get_by_key:ident,
         $get_by_mxid:ident,
         $get_all_with_mxid:ident,
+        $get_all:ident,
+        $get_all_by_uid:ident,
+        $find_private_chats:ident,
         $insert:ident,
         $update:ident,
         $delete:ident,
@@ -80,6 +83,34 @@ macro_rules! impl_portal_query_for_conn {
             let items = portal::table
                 .select(Portal::as_select())
                 .filter(portal::mxid.is_not_null())
+                .load(conn)?;
+            Ok(items)
+        }
+
+        pub fn $get_all(conn: &mut $conn_ty) -> Result<Vec<Portal>> {
+            let items = portal::table
+                .select(Portal::as_select())
+                .load(conn)?;
+            Ok(items)
+        }
+
+        pub fn $get_all_by_uid(conn: &mut $conn_ty, uid: &str) -> Result<Vec<Portal>> {
+            let items = portal::table
+                .select(Portal::as_select())
+                .filter(portal::uid.eq(uid))
+                .load(conn)?;
+            Ok(items)
+        }
+
+        pub fn $find_private_chats(conn: &mut $conn_ty, receiver: &str) -> Result<Vec<Portal>> {
+            let pattern = format!("%{}{}",
+                crate::util::SEP_UID,
+                crate::util::USER_TYPE,
+            );
+            let items = portal::table
+                .select(Portal::as_select())
+                .filter(portal::receiver.eq(receiver))
+                .filter(portal::uid.like(&pattern))
                 .load(conn)?;
             Ok(items)
         }
@@ -130,6 +161,9 @@ impl PortalQuery {
         get_by_key_sqlite,
         get_by_mxid_sqlite,
         get_all_with_mxid_sqlite,
+        get_all_sqlite,
+        get_all_by_uid_sqlite,
+        find_private_chats_sqlite,
         insert_sqlite,
         update_sqlite,
         delete_sqlite,
@@ -140,6 +174,9 @@ impl PortalQuery {
         get_by_key_postgres,
         get_by_mxid_postgres,
         get_all_with_mxid_postgres,
+        get_all_postgres,
+        get_all_by_uid_postgres,
+        find_private_chats_postgres,
         insert_postgres,
         update_postgres,
         delete_postgres,

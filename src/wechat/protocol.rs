@@ -324,6 +324,18 @@ impl Response {
     pub fn as_string(&self) -> Option<String> {
         self.data.as_ref()?.as_str().map(|s| s.to_string())
     }
+
+    /// For LoginQR response: data is base64-encoded bytes.
+    pub fn as_bytes(&self) -> Option<Vec<u8>> {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        let s = self.data.as_ref()?.as_str()?;
+        STANDARD.decode(s).ok()
+    }
+
+    /// For Event response: data is an Event.
+    pub fn as_event(&self) -> Option<Event> {
+        serde_json::from_value(self.data.clone()?).ok()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -344,4 +356,26 @@ pub struct Event {
     pub reply: Option<ReplyInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
+}
+
+impl Event {
+    /// For EventPhoto: data is an array of BlobData.
+    pub fn as_photos(&self) -> Option<Vec<super::BlobData>> {
+        serde_json::from_value(self.data.clone()?).ok()
+    }
+
+    /// For EventSticker, EventAudio, EventVideo, EventFile: data is a single BlobData.
+    pub fn as_blob(&self) -> Option<super::BlobData> {
+        serde_json::from_value(self.data.clone()?).ok()
+    }
+
+    /// For EventLocation: data is LocationData.
+    pub fn as_location(&self) -> Option<super::LocationData> {
+        serde_json::from_value(self.data.clone()?).ok()
+    }
+
+    /// For EventApp: data is AppData.
+    pub fn as_app(&self) -> Option<super::AppData> {
+        serde_json::from_value(self.data.clone()?).ok()
+    }
 }

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use std::pin::Pin;
 use std::future::Future;
@@ -8,7 +9,7 @@ use tracing::{info, error, warn, debug};
 
 use crate::config::Config;
 use crate::database::{Database, PortalKey, User as DbUser, Portal as DbPortal, Puppet as DbPuppet, Message as DbMessage};
-use crate::wechat::{WechatService, WechatClient, Event, EventType};
+use crate::wechat::{WechatService, WechatClient, Event, EventType, ChatType};
 use crate::matrix::types::RoomEvent;
 use crate::matrix::AppServiceBridge;
 use super::user::BridgeUser;
@@ -16,18 +17,44 @@ use super::portal::BridgePortal;
 use super::puppet::BridgePuppet;
 use super::command::CommandProcessor;
 
+const RECENTLY_HANDLED_SIZE: usize = 100;
+
+struct RecentlyHandled {
+    items: VecDeque<(String, String)>, // (chat_id, msg_id)
+}
+
+impl RecentlyHandled {
+    fn new() -> Self {
+        Self {
+            items: VecDeque::with_capacity(RECENTLY_HANDLED_SIZE),
+        }
+    }
+
+    fn is_handled(&self, chat_id: &str, msg_id: &str) -> bool {
+        self.items.iter().any(|(c, m)| c == chat_id && m == msg_id)
+    }
+
+    fn mark_handled(&mut self, chat_id: String, msg_id: String) {
+        if self.items.len() >= RECENTLY_HANDLED_SIZE {
+            self.items.pop_front();
+        }
+        self.items.push_back((chat_id, msg_id));
+    }
+}
+
 pub struct WechatBridge {
     pub config: Config,
     pub db: Database,
     pub wechat_service: Arc<WechatService>,
     command_processor: CommandProcessor,
-    
+
     users_by_mxid: RwLock<HashMap<String, Arc<BridgeUser>>>,
     users_by_uin: RwLock<HashMap<String, Arc<BridgeUser>>>,
     portals_by_key: RwLock<HashMap<PortalKey, Arc<BridgePortal>>>,
     portals_by_mxid: RwLock<HashMap<String, Arc<BridgePortal>>>,
     puppets_by_uin: RwLock<HashMap<String, Arc<BridgePuppet>>>,
     puppets_by_mxid: RwLock<HashMap<String, Arc<BridgePuppet>>>,
+    recently_handled: RwLock<RecentlyHandled>,
 }
 
 impl WechatBridge {
@@ -58,6 +85,7 @@ impl WechatBridge {
             portals_by_mxid: RwLock::new(HashMap::new()),
             puppets_by_uin: RwLock::new(HashMap::new()),
             puppets_by_mxid: RwLock::new(HashMap::new()),
+            recently_handled: RwLock::new(RecentlyHandled::new()),
         })
     }
 
@@ -76,7 +104,7 @@ impl WechatBridge {
         let bridge = Arc::new(self.clone());
         let mut event_rx = self.wechat_service.subscribe_events();
         tokio::spawn(async move {
-            while let Ok(event) = event_rx.recv().await {
+            while let Ok((_mxid, event)) = event_rx.recv().await {
                 if let Err(e) = bridge.handle_wechat_event(event).await {
                     error!("Error handling WeChat event: {}", e);
                 }
@@ -92,17 +120,49 @@ impl WechatBridge {
         match self.db.get_all_logged_in_users().await {
             Ok(users) => {
                 for user in users {
-                    info!("Found logged in user: {}", user.mxid);
+                    info!("Reconnecting user: {}", user.mxid);
+                    let client = WechatClient::new(user.mxid.clone(), self.wechat_service.clone());
+                    match client.connect().await {
+                        Ok(_) => {
+                            info!("User {} reconnected", user.mxid);
+                        }
+                        Err(e) => {
+                            warn!("Failed to reconnect user {}: {}", user.mxid, e);
+                        }
+                    }
                 }
             }
             Err(e) => {
                 error!("Failed to get logged in users: {}", e);
             }
         }
+
+        // Start custom puppets
+        match self.db.get_all_puppets_with_custom_mxid().await {
+            Ok(puppets) => {
+                for puppet in puppets {
+                    if puppet.custom_mxid.is_some() {
+                        info!("Starting custom puppet for {}", puppet.uin);
+                    }
+                }
+            }
+            Err(e) => error!("Failed to get custom puppets: {}", e),
+        }
     }
 
     pub async fn stop(&self) {
         info!("Stopping WeChat bridge");
+        match self.db.get_all_logged_in_users().await {
+            Ok(users) => {
+                for user in users {
+                    let client = WechatClient::new(user.mxid.clone(), self.wechat_service.clone());
+                    let _ = client.disconnect().await;
+                }
+            }
+            Err(_) => {}
+        }
+        self.wechat_service.stop().await;
+        info!("WeChat bridge stopped");
     }
 
     pub async fn get_user_by_mxid(&self, mxid: &str) -> anyhow::Result<Arc<BridgeUser>> {
@@ -218,6 +278,34 @@ impl WechatBridge {
         Ok(puppet)
     }
 
+    pub async fn get_puppet_by_mxid(&self, mxid: &str) -> anyhow::Result<Option<Arc<BridgePuppet>>> {
+        {
+            let puppets = self.puppets_by_mxid.read().await;
+            if let Some(puppet) = puppets.get(mxid) {
+                return Ok(Some(puppet.clone()));
+            }
+        }
+        // Parse the MXID to extract uin
+        if let Some(uin) = BridgePuppet::parse_puppet_mxid(mxid, &self.config.bridge.user_prefix, &self.config.homeserver.domain) {
+            let puppet = self.get_puppet_by_uin(&uin).await?;
+            let mut puppets = self.puppets_by_mxid.write().await;
+            puppets.insert(mxid.to_string(), puppet.clone());
+            Ok(Some(puppet))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn make_portal_key(&self, event: &Event) -> PortalKey {
+        match event.chat.chat_type {
+            ChatType::Group => PortalKey::new(event.chat.id.clone(), event.chat.id.clone()),
+            ChatType::Private => {
+                // For private chats, uid is the sender (remote user) and receiver is the chat id
+                PortalKey::new(event.from.id.clone(), event.chat.id.clone())
+            }
+        }
+    }
+
     pub fn get_client(&self, mxid: &str) -> WechatClient {
         WechatClient::new(mxid.to_string(), self.wechat_service.clone())
     }
@@ -240,9 +328,22 @@ impl WechatBridge {
 
     pub async fn handle_wechat_event(&self, event: Event) -> anyhow::Result<()> {
         debug!("Handling WeChat event: {:?} from {}", event.event_type, event.from.id);
-        
-        let receiver = event.from.id.clone();
-        
+
+        // Check dedup
+        {
+            let rh = self.recently_handled.read().await;
+            if rh.is_handled(&event.chat.id, &event.id) {
+                debug!("Dropping duplicate event: {} in {}", event.id, event.chat.id);
+                return Ok(());
+            }
+        }
+
+        // Mark handled before processing
+        {
+            let mut rh = self.recently_handled.write().await;
+            rh.mark_handled(event.chat.id.clone(), event.id.clone());
+        }
+
         match event.event_type {
             EventType::Text => {
                 self.handle_text_event(event).await?;
@@ -272,37 +373,37 @@ impl WechatBridge {
                 self.handle_revoke_event(event).await?;
             }
             EventType::Notice | EventType::Voip | EventType::System => {
-                debug!("Unhandled event type: {:?}", event.event_type);
+                self.handle_fake_message(event).await?;
             }
         }
-        
+
         Ok(())
     }
 
     async fn handle_text_event(&self, event: Event) -> anyhow::Result<()> {
         let chat_id = &event.chat.id;
         let sender_id = &event.from.id;
-        
-        let key = PortalKey::new(chat_id.clone(), sender_id.clone());
+
+        let key = self.make_portal_key(&event);
         let portal = self.get_portal_by_key(&key).await?;
-        let puppet = self.get_puppet_by_uin(sender_id).await?;
-        
+        let _puppet = self.get_puppet_by_uin(sender_id).await?;
+
         let Some(content) = &event.content else {
             return Ok(());
         };
 
         let client = self.get_matrix_client();
         let puppet_mxid = self.puppet_mxid(sender_id);
-        
+
         let mut portal = Arc::try_unwrap(portal).unwrap_or_else(|p| (*p).clone());
-        
+
         let room_id = portal.get_matrix_room(
             &client,
             &self.config.appservice.bot.mxid(&self.config.homeserver.domain),
             &puppet_mxid,
             Some(content),
             None,
-            event.chat.chat_type == crate::wechat::ChatType::Private,
+            event.chat.chat_type == ChatType::Private,
             self.config.bridge.encryption.default,
         ).await?;
 
@@ -311,18 +412,22 @@ impl WechatBridge {
             portals.insert(room_id.clone(), Arc::new(portal.clone()));
         }
 
-        let formatted = crate::formatter::wechat_to_matrix(content);
-        
+        let (_plain, formatted) = crate::formatter::wechat_to_matrix(content, &[]);
+
         let event_id = if let Some(reply) = &event.reply {
             if let Some(msg) = self.db.get_message_by_wechat_id(&reply.id).await? {
                 let reply_content = serde_json::json!({
+                    "msgtype": "m.text",
+                    "body": content,
+                    "format": "org.matrix.custom.html",
+                    "formatted_body": formatted,
                     "m.relates_to": {
                         "m.in_reply_to": {
                             "event_id": msg.mxid
                         }
                     }
                 });
-                client.send_text_html(&room_id, content, &formatted).await?
+                client.send_message(&room_id, "m.room.message", &reply_content, None).await?
             } else {
                 client.send_text_html(&room_id, content, &formatted).await?
             }
@@ -332,7 +437,7 @@ impl WechatBridge {
 
         let msg = DbMessage {
             chat_uid: chat_id.clone(),
-            chat_receiver: sender_id.to_string(),
+            chat_receiver: key.receiver.clone(),
             msg_id: event.id.clone(),
             mxid: event_id.clone(),
             sender: puppet_mxid,
@@ -342,7 +447,7 @@ impl WechatBridge {
             msg_type: String::new(),
         };
         self.db.insert_message(&msg).await?;
-        
+
         debug!("Bridged text message {} -> {}", event.id, event_id);
         Ok(())
     }
@@ -350,23 +455,23 @@ impl WechatBridge {
     async fn handle_photo_event(&self, event: Event) -> anyhow::Result<()> {
         let chat_id = &event.chat.id;
         let sender_id = &event.from.id;
-        
-        let key = PortalKey::new(chat_id.clone(), sender_id.clone());
+
+        let key = self.make_portal_key(&event);
         let portal = self.get_portal_by_key(&key).await?;
-        let puppet = self.get_puppet_by_uin(sender_id).await?;
-        
+        let _puppet = self.get_puppet_by_uin(sender_id).await?;
+
         let client = self.get_matrix_client();
         let puppet_mxid = self.puppet_mxid(sender_id);
-        
+
         let mut portal = Arc::try_unwrap(portal).unwrap_or_else(|p| (*p).clone());
-        
+
         let room_id = portal.get_matrix_room(
             &client,
             &self.config.appservice.bot.mxid(&self.config.homeserver.domain),
             &puppet_mxid,
             None,
             None,
-            event.chat.chat_type == crate::wechat::ChatType::Private,
+            event.chat.chat_type == ChatType::Private,
             self.config.bridge.encryption.default,
         ).await?;
 
@@ -379,7 +484,7 @@ impl WechatBridge {
             warn!("Photo event without data");
             return Ok(());
         };
-        
+
         let xml = data.get("xml")
             .and_then(|v| v.as_str())
             .unwrap_or("");
@@ -389,7 +494,7 @@ impl WechatBridge {
             Ok(image_data) => {
                 let content_type = "image/jpeg";
                 let filename = format!("image_{}.jpg", event.timestamp);
-                
+
                 match client.upload_media(&image_data, content_type, &filename).await {
                     Ok(mxc_url) => {
                         let content = serde_json::json!({
@@ -401,12 +506,12 @@ impl WechatBridge {
                                 "size": image_data.len() as u64,
                             }
                         });
-                        
+
                         let event_id = client.send_message(&room_id, "m.room.message", &content, None).await?;
-                        
+
                         let msg = DbMessage {
                             chat_uid: chat_id.clone(),
-                            chat_receiver: sender_id.to_string(),
+                            chat_receiver: key.receiver.clone(),
                             msg_id: event.id.clone(),
                             mxid: event_id.clone(),
                             sender: puppet_mxid.clone(),
@@ -416,7 +521,7 @@ impl WechatBridge {
                             msg_type: String::new(),
                         };
                         self.db.insert_message(&msg).await?;
-                        
+
                         debug!("Bridged photo message {} -> {}", event.id, event_id);
                     }
                     Err(e) => {
@@ -428,30 +533,30 @@ impl WechatBridge {
                 warn!("Failed to download image: {}", e);
             }
         }
-        
+
         Ok(())
     }
 
     async fn handle_video_event(&self, event: Event) -> anyhow::Result<()> {
         let chat_id = &event.chat.id;
         let sender_id = &event.from.id;
-        
-        let key = PortalKey::new(chat_id.clone(), sender_id.clone());
+
+        let key = self.make_portal_key(&event);
         let portal = self.get_portal_by_key(&key).await?;
-        let puppet = self.get_puppet_by_uin(sender_id).await?;
-        
+        let _puppet = self.get_puppet_by_uin(sender_id).await?;
+
         let client = self.get_matrix_client();
         let puppet_mxid = self.puppet_mxid(sender_id);
-        
+
         let mut portal = Arc::try_unwrap(portal).unwrap_or_else(|p| (*p).clone());
-        
+
         let room_id = portal.get_matrix_room(
             &client,
             &self.config.appservice.bot.mxid(&self.config.homeserver.domain),
             &puppet_mxid,
             None,
             None,
-            event.chat.chat_type == crate::wechat::ChatType::Private,
+            event.chat.chat_type == ChatType::Private,
             self.config.bridge.encryption.default,
         ).await?;
 
@@ -464,7 +569,7 @@ impl WechatBridge {
             warn!("Video event without data");
             return Ok(());
         };
-        
+
         let xml = data.get("xml")
             .and_then(|v| v.as_str())
             .unwrap_or("");
@@ -474,7 +579,7 @@ impl WechatBridge {
             Ok(video_data) => {
                 let content_type = "video/mp4";
                 let filename = format!("video_{}.mp4", event.timestamp);
-                
+
                 match client.upload_media(&video_data, content_type, &filename).await {
                     Ok(mxc_url) => {
                         let content = serde_json::json!({
@@ -486,12 +591,12 @@ impl WechatBridge {
                                 "size": video_data.len() as u64,
                             }
                         });
-                        
+
                         let event_id = client.send_message(&room_id, "m.room.message", &content, None).await?;
-                        
+
                         let msg = DbMessage {
                             chat_uid: chat_id.clone(),
-                            chat_receiver: sender_id.to_string(),
+                            chat_receiver: key.receiver.clone(),
                             msg_id: event.id.clone(),
                             mxid: event_id.clone(),
                             sender: puppet_mxid.clone(),
@@ -501,7 +606,7 @@ impl WechatBridge {
                             msg_type: String::new(),
                         };
                         self.db.insert_message(&msg).await?;
-                        
+
                         debug!("Bridged video message {} -> {}", event.id, event_id);
                     }
                     Err(e) => {
@@ -513,29 +618,29 @@ impl WechatBridge {
                 warn!("Failed to download video: {}", e);
             }
         }
-        
+
         Ok(())
     }
 
     async fn handle_audio_event(&self, event: Event) -> anyhow::Result<()> {
         let chat_id = &event.chat.id;
         let sender_id = &event.from.id;
-        
-        let key = PortalKey::new(chat_id.clone(), sender_id.clone());
+
+        let key = self.make_portal_key(&event);
         let portal = self.get_portal_by_key(&key).await?;
-        
+
         let client = self.get_matrix_client();
         let puppet_mxid = self.puppet_mxid(sender_id);
-        
+
         let mut portal = Arc::try_unwrap(portal).unwrap_or_else(|p| (*p).clone());
-        
+
         let room_id = portal.get_matrix_room(
             &client,
             &self.config.appservice.bot.mxid(&self.config.homeserver.domain),
             &puppet_mxid,
             None,
             None,
-            event.chat.chat_type == crate::wechat::ChatType::Private,
+            event.chat.chat_type == ChatType::Private,
             self.config.bridge.encryption.default,
         ).await?;
 
@@ -548,7 +653,7 @@ impl WechatBridge {
             warn!("Audio event without data");
             return Ok(());
         };
-        
+
         let xml = data.get("xml")
             .and_then(|v| v.as_str())
             .unwrap_or("");
@@ -558,7 +663,7 @@ impl WechatBridge {
             Ok(audio_data) => {
                 let content_type = "audio/ogg";
                 let filename = format!("audio_{}.ogg", event.timestamp);
-                
+
                 match client.upload_media(&audio_data, content_type, &filename).await {
                     Ok(mxc_url) => {
                         let content = serde_json::json!({
@@ -570,12 +675,12 @@ impl WechatBridge {
                                 "size": audio_data.len() as u64,
                             }
                         });
-                        
+
                         let event_id = client.send_message(&room_id, "m.room.message", &content, None).await?;
-                        
+
                         let msg = DbMessage {
                             chat_uid: chat_id.clone(),
-                            chat_receiver: sender_id.to_string(),
+                            chat_receiver: key.receiver.clone(),
                             msg_id: event.id.clone(),
                             mxid: event_id.clone(),
                             sender: puppet_mxid.clone(),
@@ -585,7 +690,7 @@ impl WechatBridge {
                             msg_type: String::new(),
                         };
                         self.db.insert_message(&msg).await?;
-                        
+
                         debug!("Bridged audio message {} -> {}", event.id, event_id);
                     }
                     Err(e) => {
@@ -597,29 +702,29 @@ impl WechatBridge {
                 warn!("Failed to download audio: {}", e);
             }
         }
-        
+
         Ok(())
     }
 
     async fn handle_file_event(&self, event: Event) -> anyhow::Result<()> {
         let chat_id = &event.chat.id;
         let sender_id = &event.from.id;
-        
-        let key = PortalKey::new(chat_id.clone(), sender_id.clone());
+
+        let key = self.make_portal_key(&event);
         let portal = self.get_portal_by_key(&key).await?;
-        
+
         let client = self.get_matrix_client();
         let puppet_mxid = self.puppet_mxid(sender_id);
-        
+
         let mut portal = Arc::try_unwrap(portal).unwrap_or_else(|p| (*p).clone());
-        
+
         let room_id = portal.get_matrix_room(
             &client,
             &self.config.appservice.bot.mxid(&self.config.homeserver.domain),
             &puppet_mxid,
             None,
             None,
-            event.chat.chat_type == crate::wechat::ChatType::Private,
+            event.chat.chat_type == ChatType::Private,
             self.config.bridge.encryption.default,
         ).await?;
 
@@ -632,7 +737,7 @@ impl WechatBridge {
             warn!("File event without data");
             return Ok(());
         };
-        
+
         let xml = data.get("xml")
             .and_then(|v| v.as_str())
             .unwrap_or("");
@@ -644,7 +749,7 @@ impl WechatBridge {
         match wechat_client.download_file(xml).await {
             Ok(file_data) => {
                 let content_type = "application/octet-stream";
-                
+
                 match client.upload_media(&file_data, content_type, filename).await {
                     Ok(mxc_url) => {
                         let content = serde_json::json!({
@@ -656,12 +761,12 @@ impl WechatBridge {
                                 "size": file_data.len() as u64,
                             }
                         });
-                        
+
                         let event_id = client.send_message(&room_id, "m.room.message", &content, None).await?;
-                        
+
                         let msg = DbMessage {
                             chat_uid: chat_id.clone(),
-                            chat_receiver: sender_id.to_string(),
+                            chat_receiver: key.receiver.clone(),
                             msg_id: event.id.clone(),
                             mxid: event_id.clone(),
                             sender: puppet_mxid.clone(),
@@ -671,7 +776,7 @@ impl WechatBridge {
                             msg_type: String::new(),
                         };
                         self.db.insert_message(&msg).await?;
-                        
+
                         debug!("Bridged file message {} -> {}", event.id, event_id);
                     }
                     Err(e) => {
@@ -683,34 +788,90 @@ impl WechatBridge {
                 warn!("Failed to download file: {}", e);
             }
         }
-        
+
         Ok(())
     }
 
     async fn handle_sticker_event(&self, event: Event) -> anyhow::Result<()> {
-        debug!("Sticker event received: {}", event.id);
-        Ok(())
-    }
-
-    async fn handle_location_event(&self, event: Event) -> anyhow::Result<()> {
         let chat_id = &event.chat.id;
         let sender_id = &event.from.id;
-        
-        let key = PortalKey::new(chat_id.clone(), sender_id.clone());
+
+        let key = self.make_portal_key(&event);
         let portal = self.get_portal_by_key(&key).await?;
-        
         let client = self.get_matrix_client();
         let puppet_mxid = self.puppet_mxid(sender_id);
-        
+
         let mut portal = Arc::try_unwrap(portal).unwrap_or_else(|p| (*p).clone());
-        
+
         let room_id = portal.get_matrix_room(
             &client,
             &self.config.appservice.bot.mxid(&self.config.homeserver.domain),
             &puppet_mxid,
             None,
             None,
-            event.chat.chat_type == crate::wechat::ChatType::Private,
+            event.chat.chat_type == ChatType::Private,
+            self.config.bridge.encryption.default,
+        ).await?;
+
+        {
+            let mut portals = self.portals_by_mxid.write().await;
+            portals.insert(room_id.clone(), Arc::new(portal.clone()));
+        }
+
+        // Get blob data from event
+        if let Some(blob) = event.as_blob() {
+            let content_type = blob.mime.as_deref().unwrap_or("image/webp");
+            let filename = blob.name.as_deref().unwrap_or("sticker.webp");
+            match client.upload_media(&blob.binary, content_type, filename).await {
+                Ok(mxc_url) => {
+                    let content = serde_json::json!({
+                        "body": filename,
+                        "url": mxc_url,
+                        "info": { "mimetype": content_type, "size": blob.binary.len() }
+                    });
+                    let event_id = client.send_message(&room_id, "m.sticker", &content, None).await?;
+                    let msg = DbMessage {
+                        chat_uid: chat_id.clone(),
+                        chat_receiver: key.receiver.clone(),
+                        msg_id: event.id.clone(),
+                        mxid: event_id.clone(),
+                        sender: puppet_mxid,
+                        timestamp: event.timestamp,
+                        sent: true,
+                        error: None,
+                        msg_type: String::new(),
+                    };
+                    self.db.insert_message(&msg).await?;
+                    debug!("Bridged sticker {} -> {}", event.id, event_id);
+                }
+                Err(e) => warn!("Failed to upload sticker: {}", e),
+            }
+        } else {
+            debug!("Sticker event without blob data: {}", event.id);
+        }
+
+        Ok(())
+    }
+
+    async fn handle_location_event(&self, event: Event) -> anyhow::Result<()> {
+        let chat_id = &event.chat.id;
+        let sender_id = &event.from.id;
+
+        let key = self.make_portal_key(&event);
+        let portal = self.get_portal_by_key(&key).await?;
+
+        let client = self.get_matrix_client();
+        let puppet_mxid = self.puppet_mxid(sender_id);
+
+        let mut portal = Arc::try_unwrap(portal).unwrap_or_else(|p| (*p).clone());
+
+        let room_id = portal.get_matrix_room(
+            &client,
+            &self.config.appservice.bot.mxid(&self.config.homeserver.domain),
+            &puppet_mxid,
+            None,
+            None,
+            event.chat.chat_type == ChatType::Private,
             self.config.bridge.encryption.default,
         ).await?;
 
@@ -729,28 +890,37 @@ impl WechatBridge {
         let name = data.get("name").and_then(|v| v.as_str()).unwrap_or("Location");
         let address = data.get("address").and_then(|v| v.as_str()).unwrap_or("");
 
+        let maps_url = format!("https://maps.google.com/?q={},{}", lat, lon);
         let body = if !address.is_empty() {
-            format!("{}: {}", name, address)
+            format!("{}: {}\n{}", name, address, maps_url)
         } else {
-            name.to_string()
+            format!("{}\n{}", name, maps_url)
         };
 
         let geo_uri = format!("geo:{},{}", lat, lon);
-        
+
+        let formatted_body = if !address.is_empty() {
+            format!("{}: {}<br/><a href=\"{}\">{}</a>", name, address, maps_url, maps_url)
+        } else {
+            format!("{}<br/><a href=\"{}\">{}</a>", name, maps_url, maps_url)
+        };
+
         let content = serde_json::json!({
             "msgtype": "m.location",
             "body": body,
             "geo_uri": geo_uri,
+            "format": "org.matrix.custom.html",
+            "formatted_body": formatted_body,
             "info": {
                 "name": name,
             }
         });
-        
+
         let event_id = client.send_message(&room_id, "m.room.message", &content, None).await?;
-        
+
         let msg = DbMessage {
             chat_uid: chat_id.clone(),
-            chat_receiver: sender_id.to_string(),
+            chat_receiver: key.receiver.clone(),
             msg_id: event.id.clone(),
             mxid: event_id.clone(),
             sender: puppet_mxid,
@@ -760,7 +930,7 @@ impl WechatBridge {
             msg_type: String::new(),
         };
         self.db.insert_message(&msg).await?;
-        
+
         debug!("Bridged location message {} -> {}", event.id, event_id);
         Ok(())
     }
@@ -768,22 +938,22 @@ impl WechatBridge {
     async fn handle_app_event(&self, event: Event) -> anyhow::Result<()> {
         let chat_id = &event.chat.id;
         let sender_id = &event.from.id;
-        
-        let key = PortalKey::new(chat_id.clone(), sender_id.clone());
+
+        let key = self.make_portal_key(&event);
         let portal = self.get_portal_by_key(&key).await?;
-        
+
         let client = self.get_matrix_client();
         let puppet_mxid = self.puppet_mxid(sender_id);
-        
+
         let mut portal = Arc::try_unwrap(portal).unwrap_or_else(|p| (*p).clone());
-        
+
         let room_id = portal.get_matrix_room(
             &client,
             &self.config.appservice.bot.mxid(&self.config.homeserver.domain),
             &puppet_mxid,
             None,
             None,
-            event.chat.chat_type == crate::wechat::ChatType::Private,
+            event.chat.chat_type == ChatType::Private,
             self.config.bridge.encryption.default,
         ).await?;
 
@@ -797,7 +967,7 @@ impl WechatBridge {
         };
 
         let title = data.get("title").and_then(|v| v.as_str()).unwrap_or("Link");
-        let desc = data.get("desc").and_then(|v| v.as_str()).unwrap_or("");
+        let _desc = data.get("desc").and_then(|v| v.as_str()).unwrap_or("");
         let url = data.get("url").and_then(|v| v.as_str()).unwrap_or("");
 
         let body = format!("{}\n\n{}", title, url);
@@ -805,12 +975,12 @@ impl WechatBridge {
             "<strong>{}</strong><br/><br/><a href=\"{}\">{}</a>",
             title, url, url
         );
-        
+
         let event_id = client.send_text_html(&room_id, &body, &html).await?;
-        
+
         let msg = DbMessage {
             chat_uid: chat_id.clone(),
-            chat_receiver: sender_id.to_string(),
+            chat_receiver: key.receiver.clone(),
             msg_id: event.id.clone(),
             mxid: event_id.clone(),
             sender: puppet_mxid,
@@ -820,7 +990,7 @@ impl WechatBridge {
             msg_type: String::new(),
         };
         self.db.insert_message(&msg).await?;
-        
+
         debug!("Bridged app message {} -> {}", event.id, event_id);
         Ok(())
     }
@@ -829,23 +999,69 @@ impl WechatBridge {
         let Some(data) = &event.data else {
             return Ok(());
         };
-        
+
         let msg_id = data.get("msg_id")
             .and_then(|v| v.as_str())
             .unwrap_or(&event.id);
 
         if let Some(msg) = self.db.get_message_by_wechat_id(msg_id).await? {
             let client = self.get_matrix_client();
-            match client.redact(&msg.chat_uid, &msg.mxid, Some("Message revoked")).await {
-                Ok(redact_event_id) => {
-                    info!("Revoked message {} -> {}", msg_id, redact_event_id);
+            if !self.config.bridge.allow_redaction {
+                // Send notice instead of redacting
+                if let Some(portal) = self.db.get_portal_by_key(&PortalKey::new(msg.chat_uid.clone(), msg.chat_receiver.clone())).await? {
+                    if let Some(room_id) = &portal.mxid {
+                        let notice = format!("Message revoked by {}", event.from.username);
+                        let content = serde_json::json!({
+                            "msgtype": "m.notice",
+                            "body": notice,
+                            "m.relates_to": {
+                                "m.in_reply_to": { "event_id": msg.mxid }
+                            }
+                        });
+                        let _ = client.send_message(room_id, "m.room.message", &content, None).await;
+                    }
                 }
-                Err(e) => {
-                    warn!("Failed to redact message: {}", e);
+            } else {
+                // Find the room and redact
+                if let Some(portal) = self.db.get_portal_by_key(&PortalKey::new(msg.chat_uid.clone(), msg.chat_receiver.clone())).await? {
+                    if let Some(room_id) = &portal.mxid {
+                        match client.redact(room_id, &msg.mxid, Some("Message revoked")).await {
+                            Ok(redact_event_id) => info!("Revoked message {} -> {}", msg_id, redact_event_id),
+                            Err(e) => warn!("Failed to redact message: {}", e),
+                        }
+                    }
                 }
             }
         }
-        
+
+        Ok(())
+    }
+
+    async fn handle_fake_message(&self, event: Event) -> anyhow::Result<()> {
+        let key = self.make_portal_key(&event);
+        let portal = self.get_portal_by_key(&key).await?;
+        let puppet_mxid = self.puppet_mxid(&event.from.id);
+        let client = self.get_matrix_client();
+
+        let mut portal = Arc::try_unwrap(portal).unwrap_or_else(|p| (*p).clone());
+
+        let room_id = portal.get_matrix_room(
+            &client,
+            &self.config.appservice.bot.mxid(&self.config.homeserver.domain),
+            &puppet_mxid,
+            None,
+            None,
+            event.chat.chat_type == ChatType::Private,
+            self.config.bridge.encryption.default,
+        ).await?;
+
+        let content = event.content.as_deref().unwrap_or("");
+        if content.is_empty() {
+            return Ok(());
+        }
+
+        let event_id = client.send_notice(&room_id, content).await?;
+        debug!("Sent fake message {} -> {}", event.id, event_id);
         Ok(())
     }
 
@@ -867,6 +1083,7 @@ impl Clone for WechatBridge {
             portals_by_mxid: RwLock::new(HashMap::new()),
             puppets_by_uin: RwLock::new(HashMap::new()),
             puppets_by_mxid: RwLock::new(HashMap::new()),
+            recently_handled: RwLock::new(RecentlyHandled::new()),
         }
     }
 }

@@ -75,6 +75,14 @@ impl BridgePortal {
 
     pub async fn set_name(&mut self, name: &str) -> anyhow::Result<()> {
         self.inner.name = name.to_string();
+        self.inner.name_set = true;
+        self.db.update_portal(&self.inner).await?;
+        Ok(())
+    }
+
+    pub async fn set_topic(&mut self, topic: &str) -> anyhow::Result<()> {
+        self.inner.topic = topic.to_string();
+        self.inner.topic_set = true;
         self.db.update_portal(&self.inner).await?;
         Ok(())
     }
@@ -120,31 +128,42 @@ impl BridgePortal {
         let room_name = name.unwrap_or(&self.inner.name);
         
         let mut initial_state = vec![];
-        
+
+        let bridge_info_content = serde_json::json!({
+            "bridgebot": client.user_id().unwrap_or(""),
+            "creator": client.user_id().unwrap_or(""),
+            "protocol": {
+                "id": "wechat",
+                "displayname": "WeChat",
+                "avatar_url": "",
+                "external_url": "",
+            },
+            "network": {
+                "id": "wechat",
+                "displayname": "WeChat",
+                "avatar_url": "",
+                "external_url": "",
+            },
+            "channel": {
+                "id": self.key.uid,
+                "displayname": room_name,
+                "avatar_url": avatar_url.unwrap_or(""),
+            },
+        });
+
+        let state_key = format!("net.maunium.wechat://wechat/{}", self.key.uid);
+
+        // Send both m.room.bridge and uk.half-shot.bridge (per Go reference)
         initial_state.push(serde_json::json!({
             "type": "m.room.bridge",
-            "state_key": format!("net.maunium.wechat://wechat/{}", self.key.uid),
-            "content": {
-                "bridgebot": client.user_id().unwrap_or(""),
-                "creator": client.user_id().unwrap_or(""),
-                "protocol": {
-                    "id": "wechat",
-                    "displayname": "WeChat",
-                    "avatar_url": "",
-                    "external_url": "",
-                },
-                "network": {
-                    "id": "wechat",
-                    "displayname": "WeChat",
-                    "avatar_url": "",
-                    "external_url": "",
-                },
-                "channel": {
-                    "id": self.key.uid,
-                    "displayname": room_name,
-                    "avatar_url": avatar_url.unwrap_or(""),
-                },
-            }
+            "state_key": state_key,
+            "content": bridge_info_content
+        }));
+
+        initial_state.push(serde_json::json!({
+            "type": "uk.half-shot.bridge",
+            "state_key": state_key,
+            "content": bridge_info_content
         }));
 
         if encrypted {
@@ -230,6 +249,11 @@ impl BridgePortal {
             }
         }
 
+        // Also update bridge info state events
+        if let Some(bot_mxid) = client.user_id() {
+            self.update_bridge_info(client, bot_mxid).await.ok();
+        }
+
         self.db.update_portal(&self.inner).await?;
         Ok(())
     }
@@ -238,6 +262,7 @@ impl BridgePortal {
         &mut self,
         client: &MatrixClient,
         puppet_mxids: &[(&str, &str, Option<&str>)],
+        user_prefix: &str,
     ) -> anyhow::Result<()> {
         let Some(room_id) = &self.inner.mxid else {
             return Ok(());
@@ -245,6 +270,12 @@ impl BridgePortal {
 
         let members = client.get_joined_members(room_id).await?;
         let mut joined_mxids: std::collections::HashSet<String> = members.joined.keys().cloned().collect();
+
+        // Collect expected puppet mxids for later comparison
+        let expected_puppet_mxids: std::collections::HashSet<String> = puppet_mxids
+            .iter()
+            .map(|(_, mxid, _)| mxid.to_string())
+            .collect();
 
         for (uin, puppet_mxid, displayname) in puppet_mxids {
             if joined_mxids.contains(*puppet_mxid) {
@@ -268,29 +299,99 @@ impl BridgePortal {
             }
         }
 
+        // Kick puppet members who are no longer in the WeChat group
+        let puppet_prefix = format!("@{}", user_prefix);
+        for leftover_mxid in &joined_mxids {
+            if leftover_mxid.starts_with(&puppet_prefix) && !expected_puppet_mxids.contains(leftover_mxid.as_str()) {
+                debug!("Kicking removed puppet {} from room {}", leftover_mxid, room_id);
+                let _ = client.kick_user(room_id, leftover_mxid, Some("User left the WeChat group")).await;
+            }
+        }
+
         self.inner.last_sync = chrono::Utc::now().timestamp();
         self.db.update_portal(&self.inner).await?;
         Ok(())
     }
 
-    pub async fn cleanup(&mut self, client: &MatrixClient) -> anyhow::Result<()> {
+    /// Clean up a portal: kick real users, leave puppet users, then clear metadata.
+    /// Ported from Go Cleanup.
+    pub async fn cleanup(&mut self, client: &MatrixClient, user_prefix: &str) -> anyhow::Result<()> {
         if let Some(room_id) = &self.inner.mxid {
-            if let Err(e) = client.leave_room(room_id).await {
-                warn!("Failed to leave room {}: {}", room_id, e);
+            // Get all joined members and handle them
+            match client.get_joined_members(room_id).await {
+                Ok(members) => {
+                    let puppet_prefix = format!("@{}", user_prefix);
+                    for member_mxid in members.joined.keys() {
+                        if member_mxid.starts_with(&puppet_prefix) {
+                            // Puppet user - leave
+                            let _ = client.leave_room(room_id).await;
+                        } else {
+                            // Real user - kick
+                            let _ = client.kick_user(room_id, member_mxid, Some("Portal deleted")).await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to get room members for cleanup: {}", e);
+                }
             }
+            let _ = client.leave_room(room_id).await;
         }
-        
+
         self.inner.mxid = None;
         self.inner.name_set = false;
         self.inner.topic_set = false;
         self.inner.avatar_set = false;
         self.db.update_portal(&self.inner).await?;
-        
+
         Ok(())
     }
 
     pub async fn delete(&self) -> anyhow::Result<()> {
         self.db.delete_portal(&self.key).await?;
+        Ok(())
+    }
+
+    /// Update bridge info state events (m.room.bridge and uk.half-shot.bridge).
+    /// Ported from Go UpdateBridgeInfo.
+    pub async fn update_bridge_info(&self, client: &MatrixClient, bot_mxid: &str) -> anyhow::Result<()> {
+        let Some(room_id) = &self.inner.mxid else {
+            return Ok(());
+        };
+        let bridge_info = serde_json::json!({
+            "bridgebot": bot_mxid,
+            "creator": bot_mxid,
+            "protocol": { "id": "wechat", "displayname": "WeChat" },
+            "network": { "id": "wechat", "displayname": "WeChat" },
+            "channel": {
+                "id": self.key.uid,
+                "displayname": self.inner.name,
+                "avatar_url": self.inner.avatar_url.as_deref().unwrap_or(""),
+            },
+        });
+        let state_key = format!("net.maunium.wechat://wechat/{}", self.key.uid);
+        client.send_state(room_id, "m.room.bridge", &state_key, &bridge_info).await?;
+        client.send_state(room_id, "uk.half-shot.bridge", &state_key, &bridge_info).await?;
+        Ok(())
+    }
+
+    /// Add this portal to a user's personal filtering space.
+    /// Ported from Go addToPersonalSpace.
+    pub async fn add_to_space(
+        &self,
+        client: &MatrixClient,
+        space_room_id: &str,
+        db: &Database,
+        user_mxid: &str,
+    ) -> anyhow::Result<()> {
+        let Some(room_id) = &self.inner.mxid else {
+            return Ok(());
+        };
+        // Add as child of the space
+        let content = serde_json::json!({ "via": [] });
+        client.send_state(space_room_id, "m.space.child", room_id, &content).await?;
+        // Mark in database
+        db.mark_in_space(user_mxid, &self.key).await?;
         Ok(())
     }
 

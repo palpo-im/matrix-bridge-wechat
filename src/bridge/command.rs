@@ -36,8 +36,9 @@ impl CommandProcessor {
             "help" | "h" | "?" => self.cmd_help(),
             "login" => CommandResult::Login,
             "logout" => CommandResult::Logout,
-            "ping" => CommandResult::Success("Pong!".to_string()),
+            "ping" => CommandResult::Ping,
             "list" => self.cmd_list(args),
+            "search" => self.cmd_search(args),
             "sync" => self.cmd_sync(args),
             "delete-portal" => CommandResult::DeletePortal,
             "delete-all-portals" => CommandResult::DeleteAllPortals,
@@ -54,6 +55,7 @@ impl CommandProcessor {
 - logout: Logout from WeChat
 - ping: Check connection status
 - list contacts/groups: List contacts or groups
+- search <query>: Search contacts and groups
 - sync contacts/groups/space: Sync data
 - delete-portal: Delete current portal
 - delete-all-portals: Delete all portals
@@ -61,6 +63,14 @@ impl CommandProcessor {
 "#
             .to_string(),
         )
+    }
+
+    fn cmd_search(&self, args: &[String]) -> CommandResult {
+        if args.is_empty() {
+            return CommandResult::Error("Usage: search <query>".to_string());
+        }
+        let query = args.join(" ");
+        CommandResult::Search(query)
     }
 
     fn cmd_list(&self, args: &[String]) -> CommandResult {
@@ -94,8 +104,10 @@ pub enum CommandResult {
     NeedsLogin,
     Login,
     Logout,
+    Ping,
     ListContacts,
     ListGroups,
+    Search(String),
     SyncContacts,
     SyncGroups,
     SyncSpace,

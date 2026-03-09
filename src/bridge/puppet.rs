@@ -5,6 +5,7 @@ use tracing::{info, debug, warn};
 use crate::database::{Puppet as DbPuppet, Database};
 use crate::matrix::client::MatrixClient;
 use crate::util::UID;
+use crate::wechat::WechatClient;
 use crate::config::BridgeConfig;
 
 pub struct BridgePuppet {
@@ -134,12 +135,17 @@ impl BridgePuppet {
         avatar_url: Option<&str>,
         force: bool,
     ) -> anyhow::Result<()> {
+        // Ensure the puppet user is registered on the homeserver
+        self.register(client).await.ok();
+
         let mxid = self.mxid(
             client.user_id()
                 .and_then(|id| id.split(':').nth(1))
                 .unwrap_or("localhost"),
             "",
         );
+
+        let mut update = false;
 
         if let Some(name) = name {
             let quality = crate::config::NAME_QUALITY_NAME as i16;
@@ -150,6 +156,7 @@ impl BridgePuppet {
                     self.inner.displayname = Some(name.to_string());
                     self.inner.name_quality = quality;
                     self.inner.name_set = true;
+                    update = true;
                 }
             }
         }
@@ -161,8 +168,14 @@ impl BridgePuppet {
                 } else {
                     self.inner.avatar_url = Some(url.to_string());
                     self.inner.avatar_set = true;
+                    update = true;
                 }
             }
+        }
+
+        // Update last_sync timestamp
+        if update || self.inner.last_sync + 86400 < chrono::Utc::now().timestamp() {
+            self.inner.last_sync = chrono::Utc::now().timestamp();
         }
 
         self.db.update_puppet(&self.inner).await?;
@@ -192,6 +205,77 @@ impl BridgePuppet {
     pub async fn save(&self) -> anyhow::Result<()> {
         self.db.update_puppet(&self.inner).await?;
         Ok(())
+    }
+
+    /// Download avatar from URL and re-upload to Matrix, returning the mxc:// URI.
+    /// Ported from Go reuploadAvatar.
+    pub async fn reupload_avatar(
+        &mut self,
+        client: &MatrixClient,
+        avatar_url: &str,
+    ) -> anyhow::Result<String> {
+        let response = reqwest::get(avatar_url).await?;
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("image/jpeg")
+            .to_string();
+        let data = response.bytes().await?;
+        let mxc_url = client.upload_media(&data, &content_type, "avatar").await?;
+        Ok(mxc_url)
+    }
+
+    /// Fetch contact info from WeChat and sync puppet name/avatar.
+    /// Ported from Go SyncContact.
+    pub async fn sync_contact(
+        &mut self,
+        wechat_client: &WechatClient,
+        matrix_client: &MatrixClient,
+    ) -> anyhow::Result<()> {
+        let user_info = wechat_client.get_user_info(self.uin()).await?;
+        self.sync(
+            matrix_client,
+            Some(&user_info.name),
+            user_info.avatar.as_deref(),
+            false,
+        ).await?;
+        Ok(())
+    }
+
+    /// Propagate puppet name changes to all DM portals.
+    /// Ported from Go updatePortalName.
+    pub async fn update_portal_name(
+        &self,
+        client: &MatrixClient,
+        db: &Database,
+        name: &str,
+    ) -> anyhow::Result<()> {
+        let portals = db.get_all_portals_by_uid(&self.inner.uin).await?;
+        for portal_data in portals {
+            if let Some(room_id) = &portal_data.mxid {
+                if portal_data.uid == self.inner.uin {
+                    // This is a DM portal, update room name
+                    let _ = client.set_room_name(room_id, name).await;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse a puppet MXID to extract the UIN.
+    /// Ported from Go ParsePuppetMXID.
+    pub fn parse_puppet_mxid(mxid: &str, user_prefix: &str, domain: &str) -> Option<String> {
+        let expected_prefix = format!("@{}", user_prefix);
+        let expected_suffix = format!(":{}", domain);
+        if mxid.starts_with(&expected_prefix) && mxid.ends_with(&expected_suffix) {
+            let uin_start = expected_prefix.len();
+            let uin_end = mxid.len() - expected_suffix.len();
+            if uin_start < uin_end {
+                return Some(mxid[uin_start..uin_end].to_string());
+            }
+        }
+        None
     }
 
     pub fn clone(&self) -> Self {

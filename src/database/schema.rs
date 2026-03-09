@@ -59,9 +59,20 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    user_portal (user_mxid, portal_uid, portal_receiver) {
+        user_mxid -> Text,
+        portal_uid -> Text,
+        portal_receiver -> Text,
+        last_read_ts -> BigInt,
+        in_space -> Bool,
+    }
+}
+
 diesel::allow_tables_to_appear_in_same_query!(
     users,
     puppet,
     portal,
     message,
+    user_portal,
 );

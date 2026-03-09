@@ -67,6 +67,7 @@ macro_rules! impl_puppet_query_for_conn {
         $get_by_uin:ident,
         $get_by_custom_mxid:ident,
         $get_all_with_custom_mxid:ident,
+        $get_all:ident,
         $insert:ident,
         $update:ident,
         $conn_ty:ty
@@ -93,6 +94,13 @@ macro_rules! impl_puppet_query_for_conn {
             let items = puppet::table
                 .select(Puppet::as_select())
                 .filter(puppet::custom_mxid.is_not_null().and(puppet::custom_mxid.ne("")))
+                .load(conn)?;
+            Ok(items)
+        }
+
+        pub fn $get_all(conn: &mut $conn_ty) -> Result<Vec<Puppet>> {
+            let items = puppet::table
+                .select(Puppet::as_select())
                 .load(conn)?;
             Ok(items)
         }
@@ -128,6 +136,7 @@ impl PuppetQuery {
         get_by_uin_sqlite,
         get_by_custom_mxid_sqlite,
         get_all_with_custom_mxid_sqlite,
+        get_all_sqlite,
         insert_sqlite,
         update_sqlite,
         SqliteConnection
@@ -137,6 +146,7 @@ impl PuppetQuery {
         get_by_uin_postgres,
         get_by_custom_mxid_postgres,
         get_all_with_custom_mxid_postgres,
+        get_all_postgres,
         insert_postgres,
         update_postgres,
         PgConnection

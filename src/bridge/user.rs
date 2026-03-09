@@ -2,7 +2,8 @@ use std::sync::Arc;
 
 use tracing::{info, warn, debug};
 
-use crate::database::{User as DbUser, Database};
+use crate::bridge::WechatBridge;
+use crate::database::{User as DbUser, Database, PortalKey};
 use crate::wechat::WechatClient;
 use crate::matrix::MatrixClient;
 use crate::config::Config;
@@ -192,18 +193,160 @@ impl BridgeUser {
         Ok(())
     }
 
-    pub async fn sync_groups(
-        &mut self,
-        _matrix_client: &MatrixClient,
+    /// Resync contacts: iterate friends and sync each puppet's name/avatar.
+    /// Ported from Go ResyncContacts.
+    pub async fn sync_contacts(
+        &self,
+        bridge: &WechatBridge,
     ) -> anyhow::Result<()> {
-        let Some(client) = &self.client else {
-            return Ok(());
-        };
-
-        let groups = client.get_group_list().await?;
-        debug!("User {} has {} groups", self.mxid, groups.len());
-
+        let client = self.client.as_ref().ok_or_else(|| anyhow::anyhow!("not logged in"))?;
+        let friends = client.get_friend_list().await?;
+        info!("Syncing {} contacts for {}", friends.len(), self.mxid);
+        let matrix_client = bridge.get_matrix_client();
+        for friend in &friends {
+            match bridge.get_puppet_by_uin(&friend.id).await {
+                Ok(puppet) => {
+                    let mut puppet = Arc::try_unwrap(puppet).unwrap_or_else(|p| (*p).clone());
+                    if let Err(e) = puppet.sync(
+                        &matrix_client,
+                        Some(&friend.name),
+                        friend.avatar.as_deref(),
+                        false,
+                    ).await {
+                        warn!("Failed to sync puppet {}: {}", friend.id, e);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to get puppet for {}: {}", friend.id, e);
+                }
+            }
+        }
         Ok(())
+    }
+
+    /// Resync groups: create or update portals for each WeChat group.
+    /// Ported from Go ResyncGroups.
+    pub async fn sync_groups(
+        &self,
+        bridge: &WechatBridge,
+        create_portals: bool,
+    ) -> anyhow::Result<()> {
+        let client = self.client.as_ref().ok_or_else(|| anyhow::anyhow!("not logged in"))?;
+        let groups = client.get_group_list().await?;
+        info!("Syncing {} groups for {}", groups.len(), self.mxid);
+        let matrix_client = bridge.get_matrix_client();
+        for group in &groups {
+            let key = PortalKey::new(group.id.clone(), group.id.clone());
+            match bridge.get_portal_by_key(&key).await {
+                Ok(portal) => {
+                    let mut portal = Arc::try_unwrap(portal).unwrap_or_else(|p| (*p).clone());
+                    if portal.mxid().is_some() {
+                        if let Err(e) = portal.update_matrix_room(
+                            &matrix_client,
+                            Some(&group.name),
+                            group.notice.as_deref(),
+                            group.avatar.as_deref(),
+                        ).await {
+                            warn!("Failed to update portal {}: {}", group.id, e);
+                        }
+                    } else if create_portals {
+                        let bot_mxid = bridge.config.appservice.bot.mxid(&bridge.config.homeserver.domain);
+                        let puppet_mxid = bridge.puppet_mxid(&group.id);
+                        if let Err(e) = portal.create_matrix_room(
+                            &matrix_client,
+                            &bot_mxid,
+                            &puppet_mxid,
+                            Some(&group.name),
+                            group.avatar.as_deref(),
+                            false,
+                            bridge.config.bridge.encryption.default,
+                        ).await {
+                            warn!("Failed to create portal for {}: {}", group.id, e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to get portal for {}: {}", group.id, e);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Get or create the user's personal filtering space room.
+    /// Ported from Go GetSpaceRoom.
+    pub async fn get_or_create_space_room(
+        &mut self,
+        matrix_client: &MatrixClient,
+    ) -> anyhow::Result<String> {
+        if let Some(room_id) = &self.inner.space_room {
+            return Ok(room_id.clone());
+        }
+        // Create a space room
+        let initial_state = vec![
+            serde_json::json!({
+                "type": "m.room.type",
+                "state_key": "",
+                "content": { "type": "m.space" }
+            }),
+        ];
+
+        let request = crate::matrix::types::CreateRoomRequest {
+            visibility: Some("private".to_string()),
+            name: Some("WeChat".to_string()),
+            topic: Some("Your WeChat bridged chats".to_string()),
+            preset: Some("private_chat".to_string()),
+            is_direct: false,
+            invite: vec![self.mxid.clone()],
+            initial_state: Some(initial_state),
+            ..Default::default()
+        };
+        let room_id = matrix_client.create_room(&request).await?;
+        self.inner.space_room = Some(room_id.clone());
+        self.db.update_user(&self.inner).await?;
+        info!("Created space room {} for user {}", room_id, self.mxid);
+        Ok(room_id)
+    }
+
+    /// Update the m.direct account data to track DM rooms.
+    /// Ported from Go UpdateDirectChats.
+    pub async fn update_direct_chats(
+        &self,
+        matrix_client: &MatrixClient,
+        puppet_mxid: &str,
+        room_id: &str,
+    ) -> anyhow::Result<()> {
+        // Would need to get current m.direct, add/update the entry, and PUT it back
+        // For now, a simplified version that just logs
+        debug!(
+            "Would update m.direct for {} with puppet {} room {}",
+            self.mxid, puppet_mxid, room_id
+        );
+        Ok(())
+    }
+
+    /// Start a private message flow: ensure portal + room exist, return room_id.
+    /// Ported from Go StartPM.
+    pub async fn start_pm(
+        &self,
+        bridge: &WechatBridge,
+        uid: &str,
+    ) -> anyhow::Result<String> {
+        let key = PortalKey::new(uid.to_string(), self.uin().unwrap_or("").to_string());
+        let portal = bridge.get_portal_by_key(&key).await?;
+        let matrix_client = bridge.get_matrix_client();
+        let puppet_mxid = bridge.puppet_mxid(uid);
+        let mut portal = Arc::try_unwrap(portal).unwrap_or_else(|p| (*p).clone());
+        let room_id = portal.get_matrix_room(
+            &matrix_client,
+            &self.mxid,
+            &puppet_mxid,
+            None,
+            None,
+            true,
+            false,
+        ).await?;
+        Ok(room_id)
     }
 
     pub fn clone(&self) -> Self {
