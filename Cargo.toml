@@ -37,6 +37,7 @@ urlencoding = "2.1"
 async-trait = "0.1"
 base64 = "0.22"
 lazy_static = "1.4"
+kdl = "4"
 
 [dev-dependencies]
 tokio-test = "0.4"

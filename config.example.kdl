@@ -1,0 +1,182 @@
+// Matrix-WeChat Bridge Configuration (KDL format)
+// Use snake_case keys in this file.
+
+homeserver {
+    // The address that this appservice can use to connect to the homeserver.
+    address "https://matrix.example.com"
+    // The domain of the homeserver (for MXIDs, etc).
+    domain "example.com"
+
+    // What software is the homeserver running?
+    // Standard Matrix homeservers like Synapse, Dendrite and Conduit should use "standard".
+    software "standard"
+    // The URL to push real-time bridge status to. null = disabled.
+    status_endpoint null
+    // Endpoint for reporting per-message status. null = disabled.
+    message_send_checkpoint_endpoint null
+    // Does the homeserver support async media (MSC2246)?
+    async_media false
+
+    // Should the bridge use a websocket for connecting to the homeserver?
+    websocket false
+    // How often should the websocket be pinged? 0 = disabled.
+    ping_interval_seconds 0
+}
+
+appservice {
+    // The address that the homeserver can use to connect to this appservice.
+    address "http://localhost:17778"
+
+    // The hostname and port where this appservice should listen.
+    hostname "0.0.0.0"
+    port 17778
+
+    // Database config.
+    database {
+        // The database type. "sqlite3" and "postgres" are supported.
+        type "postgres"
+        // The database URI.
+        uri "postgres://user:password@host/database?sslmode=disable"
+        // Maximum number of connections.
+        max_open_conns 20
+        max_idle_conns 2
+        // Maximum connection idle time and lifetime. null = disabled.
+        max_conn_idle_time null
+        max_conn_lifetime null
+    }
+
+    // The unique ID of this appservice.
+    id "wechat"
+    // Appservice bot details.
+    bot {
+        username "wechatbot"
+        displayname "WeChat bridge bot"
+        avatar "mxc://matrix.org/rddVQBTjOOmNkNLXWfYJNfPW"
+    }
+
+    // Whether or not to receive ephemeral events via appservice transactions.
+    ephemeral_events true
+
+    // Should incoming events be handled asynchronously?
+    async_transactions false
+
+    // Authentication tokens for AS <-> HS communication.
+    as_token "This value is generated when generating the registration"
+    hs_token "This value is generated when generating the registration"
+}
+
+bridge {
+    // Proxy for homeserver connection. null = disabled.
+    hs_proxy null
+    // Localpart template of MXIDs for WeChat users.
+    username_template "_wechat_{{.}}"
+    // Displayname template for WeChat users.
+    displayname_template "{{if .Name}}{{.Name}}{{else}}{{.Uin}}{{end}} (WeChat)"
+    // WeChat listen address (for agent connection).
+    listen_address "0.0.0.0:20002"
+    listen_secret "foobar"
+    // Should the bridge create a space for each logged-in user?
+    personal_filtering_spaces false
+    // Whether the bridge should send message status as a custom event.
+    message_status_events false
+    // Whether the bridge should send error notices when a message fails to bridge.
+    message_error_notices true
+    portal_message_buffer 128
+    // Enable redaction.
+    allow_redaction false
+    // Should puppet avatars be fetched from the server even if already set?
+    user_avatar_sync true
+    // Should the bridge update the m.direct account data event for double puppeting?
+    sync_direct_chat_list false
+    // Default presence bridging setting for double puppeting.
+    default_bridge_presence false
+    // Send presence as "available" to WeChat when users start typing.
+    send_presence_on_typing false
+    // Servers to always allow double puppeting from.
+    double_puppet_server_map {
+        "example.com" "https://example.com"
+    }
+    // Allow using double puppeting from any server with a valid .well-known file.
+    double_puppet_allow_discovery false
+    // Shared secrets for automatic double puppeting login.
+    login_shared_secret_map {
+        "example.com" "foobar"
+    }
+    // Whether to explicitly set the avatar and room name for private chat portal rooms.
+    // Options: "default", "always", "never"
+    private_chat_portal_meta "default"
+    // Should group members be synced in parallel?
+    parallel_member_sync false
+    // Re-send m.bridge events to all rooms on next run.
+    resend_bridge_info false
+    // When using double puppeting, should muted chats be muted in Matrix?
+    mute_bridging false
+    // Allow invite permission for user.
+    allow_user_invite false
+    // Whether created rooms should have federation enabled.
+    federate_rooms true
+    // Should the bridge never send alerts to the management room?
+    disable_bridge_alerts false
+
+    // Maximum time for handling Matrix events. null = no timeout.
+    message_handling_timeout {
+        error_after null
+        deadline "120s"
+    }
+
+    // The prefix for commands.
+    command_prefix "!wechat"
+
+    // Messages sent upon joining a management room.
+    management_room_text {
+        welcome "Hello, I'm a WeChat bridge bot."
+        welcome_connected "Use `help` for help."
+        welcome_unconnected "Use `help` for help or `login` to log in."
+        additional_help ""
+    }
+
+    // End-to-bridge encryption support options.
+    encryption {
+        allow false
+        default false
+        appservice false
+        require false
+        allow_key_sharing false
+        plaintext_mentions false
+        delete_keys {
+            delete_outbound_on_ack false
+            dont_store_outbound false
+            ratchet_on_decrypt false
+            delete_fully_used_on_decrypt false
+            delete_prev_on_new_session false
+            delete_on_device_delete false
+            periodically_delete_expired false
+            delete_outdated_inbound false
+        }
+        verification_levels {
+            receive "unverified"
+            send "unverified"
+            share "cross-signed-tofu"
+        }
+        rotation {
+            enable_custom false
+            milliseconds 604800000
+            messages 100
+            disable_device_change_key_rotation false
+        }
+    }
+
+    // Permissions for using the bridge.
+    permissions {
+        "example.com" "user"
+        "@admin:example.com" "admin"
+    }
+}
+
+logging {
+    min_level "debug"
+    writers {
+        - type="stdout" format="pretty-colored"
+        - type="file" format="json" filename="./logs/matrix-wechat.log" max_size=100 max_backups=10 compress=true
+    }
+}

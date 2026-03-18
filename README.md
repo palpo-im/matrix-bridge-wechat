@@ -80,3 +80,56 @@ Some quick links:
     * [ ] When added to group
     * [x] When receiving message
   * [x] Double puppeting
+
+## Palpo KDL Configuration
+
+When running in the [Palpo](https://github.com/palpo-im/palpo) environment, you can use KDL format for configuration. See [`config.example.kdl`](config.example.kdl) for the full annotated example.
+
+Key sections in KDL format:
+
+```kdl
+homeserver {
+    address "https://matrix.example.com"
+    domain "example.com"
+    software "standard"
+}
+
+appservice {
+    address "http://localhost:17778"
+    hostname "0.0.0.0"
+    port 17778
+    database {
+        type "postgres"
+        uri "postgres://user:password@host/database?sslmode=disable"
+    }
+    id "wechat"
+    bot {
+        username "wechatbot"
+        displayname "WeChat bridge bot"
+    }
+    as_token "replace-with-as-token"
+    hs_token "replace-with-hs-token"
+}
+
+bridge {
+    username_template "_wechat_{{.}}"
+    displayname_template "{{if .Name}}{{.Name}}{{else}}{{.Uin}}{{end}} (WeChat)"
+    listen_address "0.0.0.0:20002"
+    command_prefix "!wechat"
+    encryption {
+        allow false
+        default false
+    }
+    permissions {
+        "example.com" "user"
+        "@admin:example.com" "admin"
+    }
+}
+
+logging {
+    min_level "debug"
+    writers {
+        - type="stdout" format="pretty-colored"
+    }
+}
+```
